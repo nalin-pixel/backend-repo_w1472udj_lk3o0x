@@ -99,7 +99,7 @@ def build_params(payload: SearchPayload, provider: str) -> Dict[str, Any]:
     fields = payload.model_dump()
 
     if provider == "active":
-        # Active Jobs DB: Ultra - Get Modified Jobs 24h supports limit, offset, description_type
+        # Active Jobs DB: Modified jobs 24h supports only a narrow set of params
         allowed = ["limit", "offset", "description_type"]
     else:
         # Fantastic.jobs: pass through rich filters
@@ -140,10 +140,25 @@ def build_params(payload: SearchPayload, provider: str) -> Dict[str, Any]:
         if val is not None and val != "":
             params[key] = val
 
-    # Provide sensible defaults for Active endpoint
+    # Provide provider-specific sane defaults and clamps
     if provider == "active":
-        params.setdefault("limit", 500)
-        params.setdefault("offset", 0)
+        # Defaults per docs: limit 100 if omitted, valid range 10..100
+        limit = params.get("limit")
+        if limit is None:
+            params["limit"] = 100
+        else:
+            try:
+                lim_int = int(limit)
+            except (TypeError, ValueError):
+                lim_int = 100
+            lim_int = max(10, min(100, lim_int))
+            params["limit"] = lim_int
+        # Offset default 0
+        try:
+            params["offset"] = int(params.get("offset", 0))
+        except (TypeError, ValueError):
+            params["offset"] = 0
+        # Description type default text
         params.setdefault("description_type", "text")
 
     return params
