@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -18,19 +18,20 @@ app.add_middleware(
 
 
 class SearchPayload(BaseModel):
-    # Which freshness window to query
+    # Which freshness window to query (Fantastic.jobs only)
     time_window: str = Field(
         "7d", description="One of: 7d, 24h, hourly, backfill, expired, modified"
     )
+
     # API auth: prefer env vars, but allow passing from client for convenience during setup
     api_key: Optional[str] = Field(
-        None, description="RapidAPI key for Fantastic.jobs"
+        None, description="RapidAPI key"
     )
     api_host: Optional[str] = Field(
-        None, description="RapidAPI host, defaults to fantastic.p.rapidapi.com"
+        None, description="RapidAPI host (fantastic.p.rapidapi.com or active-jobs-db.p.rapidapi.com)"
     )
 
-    # Core search filters (pass-through)
+    # Core search filters (Fantastic.jobs)
     title_filter: Optional[str] = None
     advanced_title_filter: Optional[str] = None
     location_filter: Optional[str] = None
@@ -42,7 +43,7 @@ class SearchPayload(BaseModel):
     remote: Optional[str] = Field(None, description="true | false | None")
     include_ai: Optional[bool] = Field(False, description="Include AI-enriched fields")
 
-    # AI filters
+    # AI filters (Fantastic.jobs)
     ai_employment_type_filter: Optional[str] = None
     ai_work_arrangement_filter: Optional[str] = None
     ai_taxonomies_a_filter: Optional[str] = None
@@ -52,7 +53,7 @@ class SearchPayload(BaseModel):
     ai_experience_level_filter: Optional[str] = None
     ai_visa_sponsorship_filter: Optional[str] = None
 
-    # LinkedIn filters
+    # LinkedIn filters (Fantastic.jobs)
     include_li: Optional[bool] = Field(False)
     li_organization_slug_filter: Optional[str] = None
     li_organization_slug_exclusion_filter: Optional[str] = None
@@ -61,19 +62,28 @@ class SearchPayload(BaseModel):
     li_organization_description_filter: Optional[str] = None
 
     # Pagination
-    limit: Optional[int] = Field(20, ge=10, le=100)
+    limit: Optional[int] = Field(20, ge=1, le=500)
     offset: Optional[int] = Field(0, ge=0)
 
-    # Date filter (not for hourly/backfill)
+    # Date filter (Fantastic.jobs only; not for hourly/backfill)
     date_filter: Optional[str] = None
 
-    # Description type
+    # Description type (supported by both; Active Jobs expects text|html)
     description_type: Optional[str] = Field(
         None, description="text | html"
     )
 
 
-def get_endpoint_path(window: str) -> str:
+def detect_provider(api_host: str) -> str:
+    if not api_host:
+        return "fantastic"
+    host = api_host.lower().strip()
+    if "active-jobs-db.p.rapidapi.com" in host:
+        return "active"
+    return "fantastic"
+
+
+def get_endpoint_path_fantastic(window: str) -> str:
     mapping = {
         "7d": "/jobs/7d",
         "24h": "/jobs/24h",
@@ -85,57 +95,75 @@ def get_endpoint_path(window: str) -> str:
     return mapping.get(window, "/jobs/7d")
 
 
-def build_params(payload: SearchPayload) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
-    # Copy over non-empty fields as query params
+def build_params(payload: SearchPayload, provider: str) -> Dict[str, Any]:
     fields = payload.model_dump()
-    pass_through = [
-        "title_filter",
-        "advanced_title_filter",
-        "location_filter",
-        "description_filter",
-        "organization_filter",
-        "organization_exclusion_filter",
-        "advanced_organization_filter",
-        "source",
-        "remote",
-        "include_ai",
-        "ai_employment_type_filter",
-        "ai_work_arrangement_filter",
-        "ai_taxonomies_a_filter",
-        "ai_taxonomies_a_primary_filter",
-        "ai_taxonomies_a_exclusion_filter",
-        "ai_has_salary",
-        "ai_experience_level_filter",
-        "ai_visa_sponsorship_filter",
-        "include_li",
-        "li_organization_slug_filter",
-        "li_organization_slug_exclusion_filter",
-        "li_industry_filter",
-        "li_organization_specialties_filter",
-        "li_organization_description_filter",
-        "limit",
-        "offset",
-        "date_filter",
-        "description_type",
-    ]
-    for key in pass_through:
+
+    if provider == "active":
+        # Active Jobs DB: Ultra - Get Modified Jobs 24h supports limit, offset, description_type
+        allowed = ["limit", "offset", "description_type"]
+    else:
+        # Fantastic.jobs: pass through rich filters
+        allowed = [
+            "title_filter",
+            "advanced_title_filter",
+            "location_filter",
+            "description_filter",
+            "organization_filter",
+            "organization_exclusion_filter",
+            "advanced_organization_filter",
+            "source",
+            "remote",
+            "include_ai",
+            "ai_employment_type_filter",
+            "ai_work_arrangement_filter",
+            "ai_taxonomies_a_filter",
+            "ai_taxonomies_a_primary_filter",
+            "ai_taxonomies_a_exclusion_filter",
+            "ai_has_salary",
+            "ai_experience_level_filter",
+            "ai_visa_sponsorship_filter",
+            "include_li",
+            "li_organization_slug_filter",
+            "li_organization_slug_exclusion_filter",
+            "li_industry_filter",
+            "li_organization_specialties_filter",
+            "li_organization_description_filter",
+            "limit",
+            "offset",
+            "date_filter",
+            "description_type",
+        ]
+
+    params: Dict[str, Any] = {}
+    for key in allowed:
         val = fields.get(key)
         if val is not None and val != "":
             params[key] = val
+
+    # Provide sensible defaults for Active endpoint
+    if provider == "active":
+        params.setdefault("limit", 500)
+        params.setdefault("offset", 0)
+        params.setdefault("description_type", "text")
+
     return params
 
 
 @app.post("/api/search")
 def search_jobs(payload: SearchPayload):
-    # Prefer environment variables for security
+    # Prefer environment variables for security (Fantastic defaults)
     api_key = payload.api_key or os.getenv("FANTASTIC_RAPIDAPI_KEY")
     api_host = payload.api_host or os.getenv("FANTASTIC_RAPIDAPI_HOST", "fantastic.p.rapidapi.com")
 
-    endpoint_path = get_endpoint_path(payload.time_window)
+    provider = detect_provider(api_host)
 
-    # Construct base URL (RapidAPI default host)
-    base_url = os.getenv("FANTASTIC_BASE_URL", f"https://{api_host}")
+    if provider == "active":
+        endpoint_path = "/modified-ats-24h"
+    else:
+        endpoint_path = get_endpoint_path_fantastic(payload.time_window)
+
+    # Construct base URL from the provided host
+    base_url = f"https://{api_host}"
     url = f"{base_url}{endpoint_path}"
 
     headers = {
@@ -144,7 +172,7 @@ def search_jobs(payload: SearchPayload):
         "Accept": "application/json",
     }
 
-    params = build_params(payload)
+    params = build_params(payload, provider)
 
     # If there's no key yet, return a helpful message with empty jobs to keep UI working
     if not api_key:
@@ -152,6 +180,7 @@ def search_jobs(payload: SearchPayload):
             "jobs": [],
             "count": 0,
             "note": "Add your API key to fetch live jobs.",
+            "provider": provider,
             "endpoint": url,
             "params": params,
         }
@@ -162,22 +191,25 @@ def search_jobs(payload: SearchPayload):
         rl_headers = {
             k.lower(): v
             for k, v in resp.headers.items()
-            if k.lower().startswith("x-ratelimit")
+            if k.lower().startswith("x-ratelimit") or k.lower().startswith("ratelimit")
         }
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail={
                 "message": "Upstream API error",
                 "status": resp.status_code,
                 "text": resp.text,
+                "endpoint": url,
+                "params": params,
                 "rate_limits": rl_headers,
             })
         data = resp.json()
-        # The API typically returns an array of jobs; normalize to object
-        jobs = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
+        # Normalize: some APIs return arrays, others objects
+        jobs = data if isinstance(data, list) else data.get("results") or data.get("jobs") or data.get("data") or []
         return {
             "jobs": jobs,
             "count": len(jobs),
             "rate_limits": rl_headers,
+            "provider": provider,
         }
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail={"message": "Network error", "error": str(e)})
@@ -231,9 +263,9 @@ def test_database():
         response["database"] = f"❌ Error: {str(e)[:50]}"
 
     # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
+    import os as _os
+    response["database_url"] = "✅ Set" if _os.getenv("DATABASE_URL") else "❌ Not Set"
+    response["database_name"] = "✅ Set" if _os.getenv("DATABASE_NAME") else "❌ Not Set"
 
     return response
 
